@@ -154,7 +154,7 @@ export const Settings = ({
                 t("settings.reset_anisette_title"),
                 t("settings.reset_anisette_message"),
                 () =>
-                  toast.promise(invoke("reset_anisette_state"), {
+                  toast.promise(invoke("reset_anisette_state", { anisetteServer }), {
                     loading: t("settings.resetting_anisette_state"),
                     success: (didReset) =>
                       didReset

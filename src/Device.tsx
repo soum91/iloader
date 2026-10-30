@@ -261,7 +261,7 @@ export const Device = ({
                   }
                   await loadDevices();
                 } catch (e) {
-                  toast.error(err("Could not prepare Watch RSD pairing", e));
+                  toast.error(err("Could not prepare Watch RSD pairing", e as AppError));
                 } finally {
                   setPreparingRsd(false);
                 }

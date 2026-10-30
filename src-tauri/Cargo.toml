@@ -23,7 +23,7 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 idevice = { version = "0.1.57", features = ["usbmuxd", "house_arrest", "afc", "core_device_proxy", "remote_pairing", "tcp", "tunnel_tcp_stack", "xpc", "rsd", "pair"] }
-isideload = { version = "0.3.17", features = ["fs-storage"], git = "https://github.com/soum91/isideload", package = "isideload", rev = "cfdc66b42f30d04c43fa41ad9a56ba525a78d494" }
+isideload = { version = "0.3.17", features = ["fs-storage"], git = "https://github.com/soum91/isideload", package = "isideload", rev = "adf92c2a1302928b89676542fb1f9ba4324ee05c" }
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "linux-native-sync-persistent"] }
 tauri-plugin-store = "2"
 futures = "0.3.31"
@@ -43,6 +43,7 @@ tokio-util = "0.7.18"
 rootcause = "0.12.1"
 thiserror = "2.0.18"
 strum = {version = "0.28.0", features = ["derive"] }
+mdns-sd = "0.21.3"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"

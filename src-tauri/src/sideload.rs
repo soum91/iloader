@@ -5,9 +5,23 @@ use crate::{
     error::AppError,
     operation::Operation,
     pairing::{get_sidestore_info, place_file},
+    wifi_rsd::open_rsd_tunnel,
 };
-use isideload::sideload::{application::SpecialApp, sideloader::Sideloader};
+use idevice::{
+    RsdService,
+    provider::IdeviceProvider,
+    services::companion_proxy::CompanionProxy,
+};
+use isideload::{
+    dev::{device_type::DeveloperDeviceType, devices::DevicesApi},
+    sideload::{
+        application::SpecialApp, bundle::Bundle, install::install_app_rsd, sideloader::Sideloader,
+        watch_install::install_watch_apps_rsd,
+    },
+};
 use tauri::{AppHandle, Manager, State, Window};
+use tracing::{info, warn};
+use std::time::Duration;
 
 pub type SideloaderMutex = Mutex<Option<Sideloader>>;
 
@@ -41,6 +55,7 @@ impl Drop for SideloaderGuard<'_> {
 }
 
 pub async fn sideload(
+    handle: &AppHandle,
     device_state: State<'_, DeviceInfoMutex>,
     sideloader_state: State<'_, SideloaderMutex>,
     app_path: String,
@@ -53,9 +68,129 @@ pub async fn sideload(
         }
     };
 
-    let provider = get_provider(&device.info).await?;
-
     let mut sideloader = SideloaderGuard::take(&sideloader_state)?;
+
+    if device.info.connection_type == "Network" && device.info.network_address.is_some() {
+        info!("Installing {} over RemotePairing/RSD", device.info.udid);
+
+        let (mut rsd_provider, mut handshake) = tokio::time::timeout(
+            Duration::from_secs(75),
+            open_rsd_tunnel(handle, &device.info),
+        )
+        .await
+        .map_err(|_| AppError::RemotePairing("RSD tunnel setup timed out. Keep iPhone and Watch near each other on Wi-Fi and retry.".into()))??;
+
+        let team = sideloader.get_mut().get_team().await?;
+
+        sideloader
+            .get_mut()
+            .get_dev_session()
+            .ensure_device_registered(
+                &team,
+                &device.info.name,
+                &device.info.udid,
+                None::<DeveloperDeviceType>,
+            )
+            .await?;
+
+        // RSD signing must register paired Watches before fetching watchOS
+        // provisioning profiles. The legacy USB install path does this itself.
+        info!("Looking up paired Apple Watches for watchOS provisioning...");
+        let watch_registration = async {
+            let mut proxy = CompanionProxy::connect_rsd(&mut rsd_provider, &mut handshake).await?;
+            let watches = proxy.get_device_registry().await?;
+            for watch_udid in watches {
+                let watch_name = proxy
+                    .get_value(&watch_udid, "DeviceName")
+                    .await
+                    .ok()
+                    .and_then(|value| value.as_string().map(str::to_string))
+                    .unwrap_or_else(|| "Apple Watch".to_string());
+                sideloader
+                    .get_mut()
+                    .get_dev_session()
+                    .ensure_device_registered(
+                        &team,
+                        &watch_name,
+                        &watch_udid,
+                        Some(DeveloperDeviceType::Watchos),
+                    )
+                    .await?;
+                info!("Registered paired Apple Watch {} ({})", watch_name, watch_udid);
+            }
+            Ok::<(), AppError>(())
+        };
+        tokio::time::timeout(Duration::from_secs(45), watch_registration)
+            .await
+            .map_err(|_| AppError::RemotePairing("Timed out registering the paired Apple Watch over RSD".into()))??;
+
+        let (signed_app_path, special) = sideloader
+            .get_mut()
+            .sign_app(
+                app_path.clone().into(),
+                Some(team),
+                false,
+                None::<fn(f32) -> std::future::Ready<()>>,
+            )
+            .await?;
+
+        install_app_rsd(
+            &mut rsd_provider,
+            &mut handshake,
+            &signed_app_path,
+            |progress| {
+                info!("Installing over RSD: {}%", progress);
+            },
+        )
+        .await?;
+
+        let signed_bundle = Bundle::new(signed_app_path.clone())?;
+        let watch_apps = signed_bundle.watch_apps().to_vec();
+
+        let watch_result: Result<(), AppError> = async {
+            if !watch_apps.is_empty() {
+                info!("Installing Apple Watch companion app through the existing RSD tunnel...");
+
+                let watch_provider = get_provider(&device.info).await?;
+                let iphone_pairing = watch_provider.get_pairing_file().await.map_err(|e| {
+                    AppError::LockdownPairing(
+                        "Failed to get pairing record for Apple Watch RSD install".into(),
+                        e.to_string(),
+                    )
+                })?;
+
+                info!("Using RSD-native CompanionProxy for Apple Watch install");
+                tokio::time::timeout(Duration::from_secs(240), install_watch_apps_rsd(
+                    &mut rsd_provider,
+                    &mut handshake,
+                    &iphone_pairing,
+                    &watch_apps,
+                    "iloader",
+                    |progress| {
+                        info!("Installing Apple Watch app over RSD: {}%", progress);
+                    },
+                ))
+                .await
+                .map_err(|_| AppError::RemotePairing("Apple Watch RSD installation timed out after four minutes. The iPhone app remains installed. Check Watch pairing and the iLoader logs, then retry using the Network device.".into()))??;
+            }
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = tokio::fs::remove_dir_all(&signed_app_path).await {
+            warn!(
+                "Failed to remove temporary RSD-signed app directory {}: {}",
+                signed_app_path.display(),
+                e
+            );
+        }
+
+        watch_result?;
+        return Ok(special);
+    }
+
+    let provider = get_provider(&device.info).await?;
 
     let special = sideloader
         .get_mut()
@@ -77,11 +212,32 @@ pub async fn sideload_operation(
     sideloader_state: State<'_, SideloaderMutex>,
     app_path: String,
 ) -> Result<(), AppError> {
+    Box::pin(sideload_operation_impl(
+        window,
+        device_state,
+        sideloader_state,
+        app_path,
+    ))
+    .await
+}
+
+async fn sideload_operation_impl(
+    window: Window,
+    device_state: State<'_, DeviceInfoMutex>,
+    sideloader_state: State<'_, SideloaderMutex>,
+    app_path: String,
+) -> Result<(), AppError> {
     let op = Operation::new("sideload".to_string(), &window);
     op.start("install")?;
     op.fail_if_err(
         "install",
-        sideload(device_state, sideloader_state, app_path).await,
+        sideload(
+            window.app_handle(),
+            device_state,
+            sideloader_state,
+            app_path,
+        )
+        .await,
     )?;
     op.complete("install")?;
     Ok(())
@@ -140,6 +296,7 @@ pub async fn install_sidestore_operation(
     op.fail_if_err(
         "install",
         sideload(
+            &handle,
             device_state,
             sideloader_state,
             dest.to_string_lossy().to_string(),

@@ -26,6 +26,7 @@ jobs:
             args: ""
 
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v6
 
@@ -39,7 +40,7 @@ jobs:
             node_modules
           key: ${{ matrix.platform }}-iloader-${{ hashFiles('**/Cargo.lock', 'package-lock.json') }}
           restore-keys: |
-            ${{ runner.os }}-iloader-
+            ${{ matrix.platform }}-iloader-
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -94,8 +95,11 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          args: ${{ matrix.args }} ${{ github.event_name != 'release' && ' --config src-tauri/ci.conf.json' || '' }}
-          includeUpdaterJson: ${{ github.event_name == 'release' }}
+          # This fork has no Tauri updater signing key. Use the unsigned CI config
+          # on BOTH branch builds and release builds; it disables updater bundles
+          # and avoids using the upstream project's updater endpoint/public key.
+          args: ${{ matrix.args }} --config src-tauri/ci.conf.json
+          includeUpdaterJson: false
           releaseId: ${{ github.event_name == 'release' && github.event.release.id || '' }}
           assetNamePattern: "[name]-[platform]-[arch][ext]"
 
@@ -174,7 +178,7 @@ jobs:
 
   mark-latest:
     needs: build
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && !github.event.release.prerelease
     runs-on: ubuntu-latest
     permissions:
       contents: write

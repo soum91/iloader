@@ -19,7 +19,7 @@ use crate::{
         logged_in_as, login_new, login_stored, reset_anisette_state, revoke_certificate,
     },
     device::{
-        DeviceInfoMutex, PairingCancelToken, cancel_pairing, list_devices, set_selected_device,
+        DeviceInfoMutex, PairingCancelToken, cancel_pairing, list_devices, set_selected_device, prepare_rsd_over_usb,
     },
     pairing::{
         delete_stored_rppairing, export_pairing_cmd, has_stored_rppairing, installed_pairing_apps,
@@ -113,6 +113,7 @@ pub fn run() {
             list_devices,
             sideload_operation,
             set_selected_device,
+            prepare_rsd_over_usb,
             install_sidestore_operation,
             get_certificates,
             revoke_certificate,

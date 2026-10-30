@@ -23,11 +23,12 @@ use tracing::{info, warn};
 use crate::{
     error::AppError,
     pairing::pairing_file,
-    wifi_rsd::{bootstrap_remote_pairing, known_remote_pairing_udids},
+    wifi_rsd::{bootstrap_remote_pairing, known_remote_pairing_udids, verify_remote_pairing_at_address},
 };
 
 const MOBDEV2_SERVICE: &str = "_apple-mobdev2._tcp.local.";
-const WIFI_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(1500);
+const REMOTE_PAIRING_SERVICE: &str = "_remotepairing._tcp.local.";
+const WIFI_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const WIFI_CONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -99,6 +100,14 @@ async fn discover_wifi_addresses() -> Result<Vec<Ipv4Addr>, AppError> {
             e.to_string(),
         )
     })?;
+    // iOS 27 may advertise RemotePairing without the older wireless-lockdown
+    // service. Listen for both so the Watch RSD path remains discoverable.
+    let remote_receiver = mdns.browse(REMOTE_PAIRING_SERVICE).map_err(|e| {
+        AppError::DeviceComsWithMessage(
+            "Failed to browse for iOS RemotePairing devices".into(),
+            e.to_string(),
+        )
+    })?;
 
     let deadline = tokio::time::Instant::now() + WIFI_DISCOVERY_TIMEOUT;
     let mut addresses = HashSet::new();
@@ -109,21 +118,28 @@ async fn discover_wifi_addresses() -> Result<Vec<Ipv4Addr>, AppError> {
             break;
         }
 
-        match tokio::time::timeout(remaining, receiver.recv_async()).await {
-            Ok(Ok(ServiceEvent::ServiceResolved(service))) => {
+        let event = tokio::select! {
+            event = receiver.recv_async() => event,
+            event = remote_receiver.recv_async() => event,
+            _ = tokio::time::sleep(remaining) => break,
+        };
+
+        match event {
+            Ok(ServiceEvent::ServiceResolved(service)) => {
                 addresses.extend(service.get_addresses_v4());
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
+            Ok(_) => {}
+            Err(e) => {
                 warn!("Bonjour/mDNS receiver stopped: {e}");
                 break;
             }
-            Err(_) => break,
         }
     }
 
     let _ = mdns.stop_browse(MOBDEV2_SERVICE);
+    let _ = mdns.stop_browse(REMOTE_PAIRING_SERVICE);
     let _ = mdns.shutdown();
+    info!("Bonjour found {} candidate iPhone addresses", addresses.len());
     Ok(addresses.into_iter().collect())
 }
 
@@ -270,15 +286,15 @@ pub async fn list_devices(
 ) -> Result<Vec<Result<DeviceInfo, AppError>>, AppError> {
     let mut usbmuxd = get_usbmuxd().await?;
 
-    let selected_udid = {
+    let selected_device = {
         let guard = device_state.lock().unwrap();
-        guard.as_ref().map(|selected| selected.info.udid.clone())
+        guard.as_ref().map(|selected| selected.info.clone())
     };
 
     let mut known_udids: HashSet<String> = known_remote_pairing_udids(&app)?.into_iter().collect();
 
-    if let Some(udid) = selected_udid.as_ref() {
-        known_udids.insert(udid.clone());
+    if let Some(selected) = selected_device.as_ref() {
+        known_udids.insert(selected.udid.clone());
     }
 
     let mut known_pairings = Vec::new();
@@ -379,7 +395,7 @@ pub async fn list_devices(
     let mut network_udids: HashSet<String> = device_infos
         .iter()
         .filter_map(|result| match result {
-            Ok(device) if device.connection_type == "Network" => Some(device.udid.clone()),
+            Ok(device) if device.connection_type == "Network" && device.network_address.is_some() => Some(device.udid.clone()),
             _ => None,
         })
         .collect();
@@ -393,7 +409,30 @@ pub async fn list_devices(
                     for (expected_udid, pairing_file) in &known_pairings {
                         let device = match inspect_wifi_device(address, pairing_file).await {
                             Ok(device) => device,
-                            Err(_) => continue,
+                            Err(lockdown_error) => {
+                                // Wireless lockdown on port 62078 isn't required by RSD.
+                                // Verify the real RemotePairing identity instead of
+                                // silently discarding a reachable iOS 27 device.
+                                match verify_remote_pairing_at_address(&app, expected_udid, address).await {
+                                    Ok(()) => {
+                                        let known = selected_device.as_ref().filter(|d| d.udid == *expected_udid)
+                                            .or_else(|| device_infos.iter().filter_map(|result| result.as_ref().ok()).find(|d| d.udid == *expected_udid));
+                                        info!("Authenticated RSD device {} at {} without legacy Wi-Fi lockdown", expected_udid, address);
+                                        DeviceInfo {
+                                            name: known.map(|d| d.name.clone()).unwrap_or_else(|| "Paired iPhone".into()),
+                                            version: known.map(|d| d.version.clone()).unwrap_or_else(|| "Unknown".into()),
+                                            udid: expected_udid.clone(),
+                                            id: u32::from_be_bytes(address.octets()),
+                                            connection_type: "Network".into(),
+                                            network_address: Some(address.to_string()),
+                                        }
+                                    }
+                                    Err(remote_error) => {
+                                        warn!("Wi-Fi candidate {} for {} unavailable: lockdown: {}; RSD: {}", address, expected_udid, lockdown_error, remote_error);
+                                        continue;
+                                    }
+                                }
+                            }
                         };
 
                         if device.udid != *expected_udid {
@@ -544,6 +583,41 @@ pub async fn cancel_pairing(cancel_state: State<'_, PairingCancelToken>) -> Resu
         token.cancel();
     }
     Ok(())
+}
+
+/// Explicit RSD bootstrap gives the user a retry path and returns the actual
+/// connection error instead of silently logging it during USB selection.
+#[tauri::command]
+pub async fn prepare_rsd_over_usb(
+    app: AppHandle,
+    device_state: State<'_, DeviceInfoMutex>,
+) -> Result<String, AppError> {
+    let device = {
+        let guard = device_state.lock().unwrap();
+        guard.as_ref().map(|d| d.info.clone()).ok_or(AppError::NoDeviceSelected)?
+    };
+
+    if device.connection_type != "USB" {
+        return Err(AppError::RemotePairing("Select the USB iPhone connection to prepare RSD pairing".into()));
+    }
+
+    let mut usbmuxd = get_usbmuxd().await?;
+    let wifi_result = enable_wifi_connections(&device, &mut usbmuxd).await;
+    let provider = get_provider_from_connection(&device, &mut usbmuxd).await?;
+    tokio::time::timeout(
+        Duration::from_secs(25),
+        bootstrap_remote_pairing(&app, &device, &provider),
+    )
+    .await
+    .map_err(|_| AppError::RemotePairing("USB RemotePairing preparation timed out after 25 seconds".into()))??;
+
+    match wifi_result {
+        Ok(()) => Ok("RSD identity prepared and Wi-Fi connections enabled. Refresh devices now.".into()),
+        Err(error) => {
+            warn!("RemotePairing prepared, but Wi-Fi lockdown configuration failed: {error}");
+            Ok(format!("RSD identity prepared, but enabling Wi-Fi connections failed: {error}. Try Refresh and check the logs if Network is absent."))
+        }
+    }
 }
 
 pub async fn get_usbmuxd() -> Result<UsbmuxdConnection, AppError> {

@@ -29,6 +29,7 @@ export const Device = ({
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [waitingToPair, setWaitingToPair] = useState<DeviceInfo | null>(null);
   const [showPairingModal, setShowPairingModal] = useState(false);
+  const [preparingRsd, setPreparingRsd] = useState(false);
 
   const listingDevices = useRef<boolean>(false);
   const pairingRequestId = useRef<number>(0);
@@ -245,10 +246,30 @@ export const Device = ({
           {t("common.refresh")}
         </button>
         {selectedDevice?.connectionType === "USB" && (
-          <p className="device-watch-hint">
-            Apple Watch install: connect once by USB to prepare pairing, then
-            click Refresh and select the Network (RSD) connection.
-          </p>
+          <div className="device-watch-hint">
+            <p>Apple Watch: prepare RSD pairing over USB, then Refresh and select Network (RSD).</p>
+            <button
+              disabled={preparingRsd || waitingToPair !== null}
+              onClick={async () => {
+                setPreparingRsd(true);
+                try {
+                  const result = await invoke<string>("prepare_rsd_over_usb");
+                  if (result.includes("failed")) {
+                    toast.warning(result);
+                  } else {
+                    toast.success(result);
+                  }
+                  await loadDevices();
+                } catch (e) {
+                  toast.error(err("Could not prepare Watch RSD pairing", e));
+                } finally {
+                  setPreparingRsd(false);
+                }
+              }}
+            >
+              {preparingRsd ? "Preparing RSD..." : "Prepare Watch RSD over USB"}
+            </button>
+          </div>
         )}
       </div>
     </>

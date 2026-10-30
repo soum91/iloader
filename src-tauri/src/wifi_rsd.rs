@@ -210,6 +210,25 @@ pub async fn bootstrap_remote_pairing(
     Ok(())
 }
 
+/// Authenticate a discovered Wi-Fi host using the existing RemotePairing
+/// identity, even when iOS no longer advertises wireless lockdown on 62078.
+pub async fn verify_remote_pairing_at_address(
+    app: &AppHandle,
+    udid: &str,
+    address: Ipv4Addr,
+) -> Result<(), AppError> {
+    let path = remote_pairing_path(app, udid)?;
+    let mut pairing = RpPairingFile::read_from_file(&path)
+        .await
+        .map_err(|e| remote_error("Missing USB-bootstrap RemotePairing identity", e))?;
+    let port = discover_remote_pairing_port(address).await?;
+    let stream = connect_tcp(address, port, "Failed to connect to Wi-Fi RemotePairing").await?;
+    let mut client = RemotePairingClient::new(RpPairingSocket::new(stream), REMOTE_PAIRING_HOST);
+    client.attempt_pair_verify().await.map_err(|e| remote_error("RSD pair verification failed", e))?;
+    client.validate_pairing(&mut pairing).await.map_err(|e| remote_error("RSD identity validation failed", e))?;
+    Ok(())
+}
+
 pub async fn open_rsd_tunnel(
     app: &AppHandle,
     device: &DeviceInfo,

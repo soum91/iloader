@@ -131,28 +131,27 @@ pub fn invalidate_account(sideloader_state: State<'_, SideloaderMutex>) {
 }
 
 #[tauri::command]
-pub fn reset_anisette_state() -> Result<bool, AppError> {
-    let state_entry = Entry::new("iloader", "anisette_state").map_err(|e| {
-        AppError::KeyringWithMessage(
-            "Failed to create keyring entry for anisette".into(),
-            e.to_string(),
-        )
-    })?;
-
-    match state_entry.delete_credential() {
-        Ok(_) => {
-            debug!("Anisette state deleted from keyring.");
-            Ok(true)
+pub fn reset_anisette_state(handle: AppHandle, anisette_server: String) -> Result<bool, AppError> {
+    let url = if anisette_server.starts_with("http://") || anisette_server.starts_with("https://") {
+        anisette_server
+    } else {
+        format!("https://{}", anisette_server)
+    };
+    let key = RemoteV3AnisetteProvider::state_storage_key_for_url(&url);
+    let storage = create_sideloading_storage(&handle)?;
+    let mut found = false;
+    for name in [key.as_str(), "anisette_state"] {
+        if storage.retrieve_data(name)
+            .map_err(|e| AppError::Misc(format!("Failed to read anisette identity: {e:?}")))?
+            .is_some()
+        {
+            found = true;
         }
-        Err(keyring::Error::NoEntry) => {
-            debug!("No existing anisette state found in keyring, nothing to delete.");
-            Ok(false)
-        }
-        Err(e) => Err(AppError::KeyringWithMessage(
-            "Failed to delete anisette state".into(),
-            e.to_string(),
-        )),
+        storage.delete(name)
+            .map_err(|e| AppError::Misc(format!("Failed to reset anisette identity: {e:?}")))?;
     }
+    debug!("Cleared selected server's anisette identity without removing Apple Accounts.");
+    Ok(found)
 }
 
 async fn login(

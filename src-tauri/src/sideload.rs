@@ -97,8 +97,13 @@ pub async fn sideload(
         // provisioning profiles. The legacy USB install path does this itself.
         info!("Looking up paired Apple Watches for watchOS provisioning...");
         let watch_registration = async {
-            let mut proxy = CompanionProxy::connect_rsd(&mut rsd_provider, &mut handshake).await?;
-            let watches = proxy.get_device_registry().await?;
+            let mut proxy = CompanionProxy::connect_rsd(&mut rsd_provider, &mut handshake)
+                .await
+                .map_err(|e| AppError::RemotePairing(format!("Cannot open RSD Watch companion proxy: {e}")))?;
+            let watches = proxy
+                .get_device_registry()
+                .await
+                .map_err(|e| AppError::RemotePairing(format!("Cannot query paired Watches over RSD: {e}")))?;
             for watch_udid in watches {
                 let watch_name = proxy
                     .get_value(&watch_udid, "DeviceName")

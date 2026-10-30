@@ -31,8 +31,8 @@ export const AppleID = ({
   const [tfaCode, setTfaCode] = useState<string>("");
   const [addAccountOpen, setAddAccountOpen] = useState<boolean>(false);
   const [anisetteServer] = useStore<string>(
-    "anisetteServer",
-    "ani.sidestore.io",
+    "anisetteServer3-1",
+    "mac-ani.jkcoxson.com",
   );
   const [certs, setCerts] = useState<Certificate[] | null>(null);
   const [selectedSerials, setSelectedSerials] = useState<string[]>([]);

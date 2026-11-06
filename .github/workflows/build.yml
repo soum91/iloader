@@ -43,6 +43,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Verify installed version UI contract
+        shell: bash
+        run: |
+          if command -v python3 >/dev/null 2>&1; then
+            python3 "$GITHUB_WORKSPACE/scripts/check_version_ui.py"
+          else
+            python "$GITHUB_WORKSPACE/scripts/check_version_ui.py"
+          fi
+
       - name: Cache Rust and bun dependencies
         uses: actions/cache@v5
         with:
